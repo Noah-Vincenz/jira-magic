@@ -13,6 +13,7 @@ import matplotlib.pyplot as plt
 import datetime
 import os.path
 import numpy as np
+import requests
 
 from pygsheets.custom_types import ChartType
 from datetime import date
@@ -26,7 +27,9 @@ from collections import namedtuple
 
 
 ## EXAMPLE COMMAND TO EXECUTE THIS for sprint 8:
-## python3 jira-magic.py --sprint 8
+## python3 jira-magic.py --sprints 8 --max_sprint 8
+## python3 jira-magic.py --sprints 6,7,8 --max_sprint 8
+## python3 jira-magic.py --sprints 6 --max_sprint 8
 
 space_required_per_sprint = 30
 
@@ -34,11 +37,13 @@ Range = namedtuple('Range', ['start', 'end'])
 
 parser=argparse.ArgumentParser()
 
-parser.add_argument("--sprint", help="The sprint number. This will be used to identify which tickets part of this sprint")
+parser.add_argument("--sprints", help="The list of sprint numbers. You can pass in any arbitrary current or past sprint number here or multiple sprint numbers separated with a comma. This will be used to identify which tickets part of this sprint", default=[])
+parser.add_argument("--max_sprint", help="The maximum sprint to be present in the spreadsheet. This should either be the highest existing sprint number in the sheet when creating data for old sprints or the highest spring number that is being passed in as part of the --sprints argument. This is necessary to calculate all the sums in the summary table at the top of the sheet", default=[])
 
 args = parser.parse_args()
 
-sprint_number_from_command_line_args = args.sprint
+sprint_numbers_from_command_line_args = map(str, args.sprints.strip('[]').split(','))
+max_sprint_from_command_line_args = args.max_sprint
 date_format = '%Y-%m-%d'
 
 first_sprint_number = 5 # first sprint for which we have data
@@ -46,6 +51,7 @@ first_sprint_number = 5 # first sprint for which we have data
 sprint_0_start_date = datetime.date(2022, 6, 29)
 sprint_0_end_date = datetime.date(2022, 7, 13)
 
+gov_uk_bank_holidays_url = 'https://www.gov.uk/bank-holidays.json'
 # If modifying these scopes, delete the file token.json.
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 
@@ -368,13 +374,16 @@ def get_tickets_dictionaries(dict, current_sprint):
 def get_days_worked_by_name(team_out_of_office_events, sprint_start_date, sprint_end_date, google_name):
     sprint_end_date = sprint_end_date + datetime.timedelta(days=1) # adding 1 day to sprint end because for OOO days we say end day is when an individual is no longer OOO
     days_worked = 10
+    for bank_holiday in get_uk_bank_holidays():
+        if (sprint_start_date <= datetime.datetime.strptime(bank_holiday, '%Y-%m-%d').date() <= sprint_end_date):
+            days_worked = days_worked - 1
     individual_out_of_office_events = [event for event in team_out_of_office_events if str(google_name) in event['summary']]
     for out_of_office_event in individual_out_of_office_events:
         start_ooo_str = out_of_office_event['start'].get('dateTime', out_of_office_event['start'].get('date'))
         end_ooo_str = out_of_office_event['end'].get('dateTime', out_of_office_event['end'].get('date'))
         print('Start OOO -', start_ooo_str)
         print('End OOO -', end_ooo_str)
-        # get overlap
+        # get overlap between OOO dates and sprint dates to find out how many days of the sprint the individual has been off
         start_ooo = datetime.datetime.strptime(start_ooo_str, date_format).date()
         end_ooo = datetime.datetime.strptime(end_ooo_str, date_format).date()
         r1 = Range(start=sprint_start_date, end=sprint_end_date)
@@ -390,6 +399,15 @@ def get_days_worked_by_name(team_out_of_office_events, sprint_start_date, sprint
             overlap = business_days
         days_worked = days_worked - overlap
     return days_worked
+
+
+def get_uk_bank_holidays():
+    # sending get request and saving the response as response object
+    r = requests.get(url = gov_uk_bank_holidays_url)
+    # extracting data in json format for england and wales bank holidays
+    bank_holidays_obj_array = r.json()['england-and-wales']['events']
+    bank_holidays_dates_array = [bank_holiday_obj['date'] for bank_holiday_obj in bank_holidays_obj_array]
+    return bank_holidays_dates_array
 
 
 def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_date, sprint_end_date):
@@ -436,6 +454,9 @@ def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_d
     sprint_header_index = sprint_top_row_index - 3
     # for sprint length w/o weekend days
     business_days = np.busday_count(sprint_start_date, sprint_end_date) + 1
+    for bank_holiday in get_uk_bank_holidays():
+        if (sprint_start_date <= datetime.datetime.strptime(bank_holiday, '%Y-%m-%d').date() <= sprint_end_date):
+            business_days = business_days - 1
     # set sprint header
     worksheet.cell('C' + str(sprint_header_index)).set_text_format('bold', True).value = 'Sprint ' + str(current_sprint)
     worksheet.cell('C' + str(sprint_header_index + 1)).value = 'Date'
@@ -487,27 +508,33 @@ def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_d
     print('sprint start date:', sprint_start_date)
     print('sprint end date:', sprint_end_date)
 
-def compute_velocities(worksheet, number_of_sprints_computed, index):
+
+def append_to_sum_formula_str(sum_formula_str, cell_to_add):
+    sum_formula_str = sum_formula_str[:-1] # remove last char from string, ie ')'
+    sum_formula_str = sum_formula_str + ',' + cell_to_add + ')'
+    return sum_formula_str
+
+
+def compute_velocities(worksheet, max_sprint_from_command_line_args, index):
     # each sprint section is space_required_per_sprint spaces long
-
-    # TODO: UPDATE TO USE SHEETS FORMULA INSTEAD OF ACTUAL VALUES
-
     first_sprint_data_row = index + 1 + first_sprint_number * space_required_per_sprint
-    max_sprint_data_row = first_sprint_data_row + number_of_sprints_computed * space_required_per_sprint
-    print(max_sprint_data_row)
-    sum_of_days_worked = 0
-    sum_of_started_points = 0
-    sum_of_completed_points = 0
-    while first_sprint_data_row < max_sprint_data_row:
-        print('in data row: ', first_sprint_data_row)
-        print('looking at cell D' + str(first_sprint_data_row))
-        print(worksheet.cell('D' + str(first_sprint_data_row)))
-        print(worksheet.cell('D' + str(first_sprint_data_row)).value)
-        sum_of_days_worked = float(sum_of_days_worked) + float(worksheet.cell('D' + str(first_sprint_data_row)).value)
-        sum_of_started_points = float(sum_of_started_points) + float(worksheet.cell('E' + str(first_sprint_data_row)).value)
-        sum_of_completed_points = float(sum_of_completed_points) + float(worksheet.cell('F' + str(first_sprint_data_row)).value)
-        first_sprint_data_row = first_sprint_data_row + space_required_per_sprint
-    return (sum_of_days_worked, sum_of_started_points, sum_of_completed_points)
+    print('first sprint first data row ', str(first_sprint_data_row))
+    max_first_sprint_data_row = (max_sprint_from_command_line_args + 1) * space_required_per_sprint
+    sum_of_days_worked_str = 'SUM(0)'
+    sum_of_started_points_str = 'SUM(0)'
+    sum_of_completed_points_str = 'SUM(0)'
+    number_of_sprints_computed = 0
+    while first_sprint_data_row < max_first_sprint_data_row:
+        if (worksheet.cell('D' + str(first_sprint_data_row)).value != ''):
+            sum_of_days_worked_str = append_to_sum_formula_str(sum_of_days_worked_str, 'D' + str(first_sprint_data_row))
+            sum_of_started_points_str = append_to_sum_formula_str(sum_of_started_points_str, 'E' + str(first_sprint_data_row))
+            sum_of_completed_points_str = append_to_sum_formula_str(sum_of_completed_points_str, 'F' + str(first_sprint_data_row))
+            first_sprint_data_row = first_sprint_data_row + space_required_per_sprint
+            number_of_sprints_computed = number_of_sprints_computed + 1
+        else:
+            first_sprint_data_row = first_sprint_data_row + space_required_per_sprint
+
+    return (number_of_sprints_computed, sum_of_days_worked_str, sum_of_started_points_str, sum_of_completed_points_str)
 
 
 def draw_overall_chart():
@@ -533,27 +560,45 @@ def main():
     wks.title = "Velocity Tracker"
     wks.adjust_column_width(start=3, end=6, pixel_size=200)
     existing_charts = wks.get_charts()
-    for chart in existing_charts:
-        chart.delete()
-    wks.clear()
-    number_of_sprints_computed = int(sprint_number_from_command_line_args) - first_sprint_number + 1
+    # wks.clear() # in case we want the worksheet to be cleared of all data
+    # number_of_sprints_computed = int(max_sprint_from_command_line_args) - first_sprint_number + 1
     sum_of_days_per_sprint = 0
-    for current_sprint in range(first_sprint_number, int(sprint_number_from_command_line_args) + 1):
-        sprint_start_date = get_sprint_start_date(int(current_sprint))
-        sprint_end_date = get_sprint_end_date(int(current_sprint))
-        business_days_in_sprint = np.busday_count(sprint_start_date, sprint_end_date) + 1
-        sum_of_days_per_sprint = sum_of_days_per_sprint + business_days_in_sprint
-        fill_sprint_sheet_data(df, wks, current_sprint, sprint_start_date, sprint_end_date)
+    # for current_sprint in range(first_sprint_number, int(sprint_number_from_command_line_args) + 1):
+    for current_sprint in sprint_numbers_from_command_line_args:
+        if (int(current_sprint) >= first_sprint_number):
+            # delete charts that we are re-creating
+            for chart in existing_charts:
+                if (current_sprint in chart.title):
+                    chart.delete()
+            sprint_start_date = get_sprint_start_date(int(current_sprint))
+            sprint_end_date = get_sprint_end_date(int(current_sprint))
+            business_days_in_sprint = np.busday_count(sprint_start_date, sprint_end_date) + 1
+            for bank_holiday in get_uk_bank_holidays():
+                if (sprint_start_date <= datetime.datetime.strptime(bank_holiday, '%Y-%m-%d').date() <= sprint_end_date):
+                    print('Found a UK bank holiday during the sprint: ', bank_holiday)
+                    business_days_in_sprint = business_days_in_sprint - 1
+            sum_of_days_per_sprint = sum_of_days_per_sprint + business_days_in_sprint
+            fill_sprint_sheet_data(df, wks, current_sprint, sprint_start_date, sprint_end_date)
     index = 0
     for team_member in team_members_jira:
-        (sum_of_days_worked, sum_of_started_points, sum_of_completed_points) = compute_velocities(wks, number_of_sprints_computed, index)
-        print('computed data for ', team_member)
-        print(sum_of_days_worked, sum_of_started_points, sum_of_completed_points)
-        avg_velocity = sum_of_completed_points / sum_of_days_worked * sum_of_days_per_sprint / number_of_sprints_computed
-        df2 = pd.DataFrame([SummaryRow(str(team_member), avg_velocity, sum_of_started_points / number_of_sprints_computed, sum_of_completed_points / number_of_sprints_computed)])
+        (number_of_sprints_computed, sum_of_days_worked_formula, sum_of_started_points_formula, sum_of_completed_points_formula) = compute_velocities(wks, int(max_sprint_from_command_line_args), index)
+        print('computed data for', team_member)
+        print(number_of_sprints_computed, sum_of_days_worked_formula, sum_of_started_points_formula, sum_of_completed_points_formula)
+        avg_velocity = '=' + sum_of_completed_points_formula + '/' + sum_of_days_worked_formula + '*' + str(sum_of_days_per_sprint) + '/' + str(number_of_sprints_computed)
+        df2 = pd.DataFrame([SummaryRow(str(team_member), avg_velocity, '=' + sum_of_started_points_formula + '/' + str(number_of_sprints_computed), '=' + sum_of_completed_points_formula + '/' + str(number_of_sprints_computed))])
         df = pd.concat([df, df2])
         index = index + 1
-    wks.set_dataframe(df, (3, 3)) # inserting summary table at (3,3)
+    start_row_of_summary_table = 3
+    end_row_of_summary_table = start_row_of_summary_table + len(team_members_jira)
+    start_column_of_summary_table = 3
+    wks.set_dataframe(df, (start_row_of_summary_table, start_column_of_summary_table)) # inserting summary table at (3,3)
+    # make headers bold
+    wks.cell('C' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    wks.cell('D' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    wks.cell('E' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    wks.cell('F' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    wks.cell('D' + str(end_row_of_summary_table + 2)).set_text_format('bold', True).value = 'SQUAD CURRENT VELOCITY'
+    wks.cell('D' + str(end_row_of_summary_table + 3)).value = '=SUM(D' + str(start_row_of_summary_table + 1) + ':D' + str(end_row_of_summary_table) + ')'
     draw_overall_chart()
 
 
