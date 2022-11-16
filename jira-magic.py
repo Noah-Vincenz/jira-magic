@@ -28,7 +28,7 @@ from collections import namedtuple
 
 ## EXAMPLE COMMAND TO EXECUTE THIS for sprint 8:
 ## python3 jira-magic.py --sprints 8 --max_sprint 8
-## python3 jira-magic.py --sprints 6,7,8 --max_sprint 8
+## python3 jira-magic.py --sprints 5,6,7,8 --max_sprint 8
 ## python3 jira-magic.py --sprints 6 --max_sprint 8
 
 space_required_per_sprint = 30
@@ -71,6 +71,11 @@ team_members_google = sorted(devs_google + qes_google)
 devs_jira_str = '("' + '", "'.join(devs_jira) + '")'
 qes_jira_str = '("' + '", "'.join(qes_jira) + '")'
 
+start_row_of_summary_table = 3
+end_row_of_summary_table = start_row_of_summary_table + len(team_members_jira)
+start_column_of_summary_table = 3
+
+squad_velocity_chart_name = 'Squad Velocity Per Sprint'
 
 server = 'https://yapily.atlassian.net'
 email = 'noah-vincenz.noeh@yapily.com'
@@ -149,21 +154,17 @@ def get_team_out_of_office_events(current_sprint):
         start_of_sprint_date = get_sprint_start_date(int(current_sprint))
         start_of_sprint_datetime = datetime.datetime.strptime(str(start_of_sprint_date), date_format)
         start_of_sprint_datetime_utc = start_of_sprint_datetime.isoformat() + 'Z' # 'Z' indicates UTC time
-        print('Start of sprint in UTC time:', start_of_sprint_datetime_utc)
         personal_calendar_id = 'primary' # or 'noah-vincenz.noeh@yapily.com'
         who_is_out_calendar_id = 'liis4au1bmg4dhnieis2vaa95rv3efte@import.calendar.google.com'
         events_result = service.events().list(calendarId=who_is_out_calendar_id, 
                                               timeMin=start_of_sprint_datetime_utc,
                                               singleEvents=True,
                                               orderBy='startTime').execute()
-        print('finished 2')
         events = events_result.get('items', [])
 
         if not events:
             print('No upcoming events found.')
             return
-
-        print('All Yapily out of office events')
         team_out_of_office_events = [event for event in events if event_is_linked_to_team(event['summary'])]
         return team_out_of_office_events
 
@@ -410,18 +411,35 @@ def get_uk_bank_holidays():
     return bank_holidays_dates_array
 
 
-def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_date, sprint_end_date):
-    print('sprint start date:', sprint_start_date)
-    print('sprint end date:', sprint_end_date)
-        
+def get_sprint_length_from_sprint_dates(sprint_start_date, sprint_end_date):
+    # for sprint length w/o weekend days
+    business_days = np.busday_count(sprint_start_date, sprint_end_date) + 1
+    for bank_holiday in get_uk_bank_holidays():
+        if (sprint_start_date <= datetime.datetime.strptime(bank_holiday, '%Y-%m-%d').date() <= sprint_end_date):
+            business_days = business_days - 1
+    return business_days
+
+
+def compute_individual_sprint_data_frame(data_frame, current_sprint, individual_name, individual_obj, squad_velocity, sprint_start_date, sprint_end_date):
+    days_in_sprint = get_sprint_length_from_sprint_dates(sprint_start_date, sprint_end_date)
+    ((_, individual_started_value), (_, individual_completed_value)) = individual_obj.items()
+    google_name = get_google_name_from_jira_name(individual_name)
+
     team_out_of_office_events = get_team_out_of_office_events(current_sprint)
     # filter all OOO to reduce to the ones during this sprint, ie the OOO start date is on or before the end date of the sprint
     team_out_of_office_events_during_sprint = [event for event in team_out_of_office_events if datetime.datetime.strptime(event['start'].get('dateTime', event['start'].get('date')), date_format).date() <= sprint_end_date]
-    print('Out Of Office Events')
-    for event in team_out_of_office_events_during_sprint:
-        start = event['start'].get('dateTime', event['start'].get('date'))
-        end = event['end'].get('dateTime', event['end'].get('date'))
-        print(start, event['summary'], end)
+
+    individual_days_worked = get_days_worked_by_name(team_out_of_office_events_during_sprint, sprint_start_date, sprint_end_date, google_name)
+    if (individual_days_worked != 0): # add individual's data to squad velocity for this sprint
+        squad_velocity = squad_velocity + (individual_completed_value / individual_days_worked * days_in_sprint)
+    df2 = pd.DataFrame([SprintRow(str(individual_name), individual_days_worked, individual_started_value, individual_completed_value)])
+    data_frame = pd.concat([data_frame, df2])
+    return squad_velocity
+
+
+def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_date, sprint_end_date):
+    print('sprint start date:', sprint_start_date)
+    print('sprint end date:', sprint_end_date)
 
     tickets_dict = create_tickets_dict()
 
@@ -434,29 +452,19 @@ def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_d
             print(key, ' : ', value)
         print('\n')
 
-    print('Unassigned Tickets')
-    for key, value in unassigned_tickets_dict.items():
-        print('Ticket:', key, 'Points:', value)
+    if len(unassigned_tickets_dict.items()) != 0:
+        print('Unassigned Tickets')
+        for key, value in unassigned_tickets_dict.items():
+            print('Ticket:', key, 'Points:', value)
 
-
-    print(assigned_tickets_dict.items())
+    business_days = get_sprint_length_from_sprint_dates(sprint_start_date, sprint_end_date)
+    squad_velocity = 0
     for name, value in assigned_tickets_dict.items():
-        print(name)
-        print(value.items())
-        ((_, started_value), (_, completed_value)) = value.items()
-        google_name = get_google_name_from_jira_name(name)
-        individual_days_worked = get_days_worked_by_name(team_out_of_office_events_during_sprint, sprint_start_date, sprint_end_date, google_name)
-        df2 = pd.DataFrame([SprintRow(str(name), individual_days_worked, started_value, completed_value)])
-        data_frame = pd.concat([data_frame, df2])
+        squad_velocity = compute_individual_sprint_data_frame(data_frame, current_sprint, name, value, squad_velocity, sprint_start_date, sprint_end_date)        
 
     #update the first sheet with df, starting in column C (= 3) and row Sprint x space_required_per_sprint, because space_required_per_sprint rows is the space required for each sprint's data.
     sprint_top_row_index = int(current_sprint) * space_required_per_sprint
     sprint_header_index = sprint_top_row_index - 3
-    # for sprint length w/o weekend days
-    business_days = np.busday_count(sprint_start_date, sprint_end_date) + 1
-    for bank_holiday in get_uk_bank_holidays():
-        if (sprint_start_date <= datetime.datetime.strptime(bank_holiday, '%Y-%m-%d').date() <= sprint_end_date):
-            business_days = business_days - 1
     # set sprint header
     worksheet.cell('C' + str(sprint_header_index)).set_text_format('bold', True).value = 'Sprint ' + str(current_sprint)
     worksheet.cell('C' + str(sprint_header_index + 1)).value = 'Date'
@@ -480,6 +488,8 @@ def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_d
     worksheet.cell('C' + str(sprint_footer_data_row_index + 2)).set_text_format('bold', True).value = 'MAX'
     worksheet.cell('C' + str(sprint_footer_data_row_index + 3)).set_text_format('bold', True).value = 'AVG'
     worksheet.cell('C' + str(sprint_footer_data_row_index + 4)).set_text_format('bold', True).value = 'SUM'
+    worksheet.cell('C' + str(sprint_footer_data_row_index + 6)).set_text_format('bold', True).value = 'SQUAD VELOCITY'
+
     # set the min values
     worksheet.update_value('D' + str(sprint_footer_data_row_index + 1), '=min(' + days_worked_range_str + ')')
     worksheet.update_value('E' + str(sprint_footer_data_row_index + 1), '=min(' + story_points_started_range_str + ')')
@@ -496,7 +506,12 @@ def fill_sprint_sheet_data(data_frame, worksheet, current_sprint, sprint_start_d
     worksheet.update_value('D' + str(sprint_footer_data_row_index + 4), '=sum(' + days_worked_range_str + ')')
     worksheet.update_value('E' + str(sprint_footer_data_row_index + 4), '=sum(' + story_points_started_range_str + ')')
     worksheet.update_value('F' + str(sprint_footer_data_row_index + 4), '=sum(' + story_points_completed_range_str + ')')
-    
+    # set the squad velocity value
+    cell_for_sprint_velocity = 'C' + str(sprint_footer_data_row_index + 7)
+    worksheet.update_value(cell_for_sprint_velocity, str(squad_velocity))
+    worksheet.update_value('C' + str(end_row_of_summary_table + int(current_sprint)), str(current_sprint))
+    worksheet.update_value('D' + str(end_row_of_summary_table + int(current_sprint)), '=' + cell_for_sprint_velocity)
+
     worksheet.set_dataframe(data_frame, (sprint_top_row_index, 3))
 
     current_sprint_chart = worksheet.add_chart(domain=('C' + str(sprint_first_data_row_index), 'C' + str(sprint_last_data_row_index)), 
@@ -518,7 +533,6 @@ def append_to_sum_formula_str(sum_formula_str, cell_to_add):
 def compute_velocities(worksheet, max_sprint_from_command_line_args, index):
     # each sprint section is space_required_per_sprint spaces long
     first_sprint_data_row = index + 1 + first_sprint_number * space_required_per_sprint
-    print('first sprint first data row ', str(first_sprint_data_row))
     max_first_sprint_data_row = (max_sprint_from_command_line_args + 1) * space_required_per_sprint
     sum_of_days_worked_str = 'SUM(0)'
     sum_of_started_points_str = 'SUM(0)'
@@ -537,15 +551,26 @@ def compute_velocities(worksheet, max_sprint_from_command_line_args, index):
     return (number_of_sprints_computed, sum_of_days_worked_str, sum_of_started_points_str, sum_of_completed_points_str)
 
 
-def draw_overall_chart():
-    # all_sprints_line_chart = wks.add_chart(domain=('C' + str(sprint_first_data_row_index), 'C' + str(sprint_last_data_row_index)), 
-    #                 ranges=[('F' + str(sprint_first_data_row_index), 'F' + str(sprint_last_data_row_index))], 
-    #                 title='Story Points Completed Per Sprint',
-    #                 chart_type=ChartType.LINE, # taken from : BAR, LINE, AREA, COLUMN, SCATTER, COMBO, STEPPED_AREA
-    #                 anchor_cell='B5')
-    return
+def draw_overall_chart(worksheet):
+    all_sprints_velocity_chart = worksheet.add_chart(domain=('C' + str(end_row_of_summary_table + first_sprint_number - 1), 'C' + str(end_row_of_summary_table + int(max_sprint_from_command_line_args))), 
+                            ranges=[('D' + str(end_row_of_summary_table + first_sprint_number - 1), 'D' + str(end_row_of_summary_table + int(max_sprint_from_command_line_args)))], 
+                            title=squad_velocity_chart_name,
+                            chart_type=ChartType.LINE, # taken from : BAR, LINE, AREA, COLUMN, SCATTER, COMBO, STEPPED_AREA
+                            anchor_cell='H' + str(start_row_of_summary_table))
 
 
+def make_summary_table_headers_bold_and_set_velocity(worksheet):
+    # make headers bold
+    worksheet.cell('C' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    worksheet.cell('D' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    worksheet.cell('E' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    worksheet.cell('F' + str(start_row_of_summary_table)).set_text_format('bold', True)
+    # set AVG velocity
+    worksheet.cell('E' + str(end_row_of_summary_table + first_sprint_number - 1)).set_text_format('bold', True).value = 'SQUAD AVG VELOCITY (ACROSS ALL SPRINTS)'
+    worksheet.cell('E' + str(end_row_of_summary_table + first_sprint_number)).value = '=SUM(D' + str(start_row_of_summary_table + 1) + ':D' + str(end_row_of_summary_table) + ')'
+    # create squad velocity headers
+    worksheet.cell('C' + str(end_row_of_summary_table + first_sprint_number - 1)).set_text_format('bold', True).value = 'Sprint'
+    worksheet.cell('D' + str(end_row_of_summary_table + first_sprint_number - 1)).set_text_format('bold', True).value = 'Squad Velocity'
 
 
 def main():
@@ -557,18 +582,16 @@ def main():
     sh = gc.open('Integrations Team')
     #select the first sheet 
     wks = sh[0]
-    wks.title = "Velocity Tracker"
+    wks.title = 'Velocity Tracker'
     wks.adjust_column_width(start=3, end=6, pixel_size=200)
     existing_charts = wks.get_charts()
     # wks.clear() # in case we want the worksheet to be cleared of all data
-    # number_of_sprints_computed = int(max_sprint_from_command_line_args) - first_sprint_number + 1
     sum_of_days_per_sprint = 0
-    # for current_sprint in range(first_sprint_number, int(sprint_number_from_command_line_args) + 1):
     for current_sprint in sprint_numbers_from_command_line_args:
         if (int(current_sprint) >= first_sprint_number):
             # delete charts that we are re-creating
             for chart in existing_charts:
-                if (current_sprint in chart.title):
+                if (current_sprint in chart.title or chart.title == squad_velocity_chart_name):
                     chart.delete()
             sprint_start_date = get_sprint_start_date(int(current_sprint))
             sprint_end_date = get_sprint_end_date(int(current_sprint))
@@ -588,18 +611,9 @@ def main():
         df2 = pd.DataFrame([SummaryRow(str(team_member), avg_velocity, '=' + sum_of_started_points_formula + '/' + str(number_of_sprints_computed), '=' + sum_of_completed_points_formula + '/' + str(number_of_sprints_computed))])
         df = pd.concat([df, df2])
         index = index + 1
-    start_row_of_summary_table = 3
-    end_row_of_summary_table = start_row_of_summary_table + len(team_members_jira)
-    start_column_of_summary_table = 3
     wks.set_dataframe(df, (start_row_of_summary_table, start_column_of_summary_table)) # inserting summary table at (3,3)
-    # make headers bold
-    wks.cell('C' + str(start_row_of_summary_table)).set_text_format('bold', True)
-    wks.cell('D' + str(start_row_of_summary_table)).set_text_format('bold', True)
-    wks.cell('E' + str(start_row_of_summary_table)).set_text_format('bold', True)
-    wks.cell('F' + str(start_row_of_summary_table)).set_text_format('bold', True)
-    wks.cell('D' + str(end_row_of_summary_table + 2)).set_text_format('bold', True).value = 'SQUAD CURRENT VELOCITY'
-    wks.cell('D' + str(end_row_of_summary_table + 3)).value = '=SUM(D' + str(start_row_of_summary_table + 1) + ':D' + str(end_row_of_summary_table) + ')'
-    draw_overall_chart()
+    make_summary_table_headers_bold_and_set_velocity(wks)
+    draw_overall_chart(wks)
 
 
 if __name__ == '__main__':
